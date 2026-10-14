@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f7f4" />
+    <title>LabelCheck — Alcohol label review</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="wordmark" href="#top" aria-label="LabelCheck home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span>label<span class="wordmark-light">check</span></span>
+        </a>
+        <div class="sidebar-rule"></div>
+        <div class="workspace-label">WORKSPACE</div>
+        <a class="nav-item active" href="#review"><span class="nav-icon">◫</span> New review <span class="nav-plus">+</span></a>
+        <a class="nav-item muted" href="#how-it-works"><span class="nav-icon">◷</span> How it works</a>
+        <div class="sidebar-spacer"></div>
+        <div class="sidebar-note">
+          <span class="note-icon">✳</span>
+          <div><strong>Review with confidence</strong><p>OCR flags likely matches. You make the call.</p></div>
+        </div>
+        <div class="sidebar-footer"><span class="status-dot"></span> Prototype mode</div>
+      </aside>
+
+      <main class="main-content" id="top">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Workspace</span><span class="crumb-slash">/</span><strong>New review</strong></div>
+          <div class="topbar-right"><span class="local-badge"><span class="status-dot"></span> Images stay on this device</span><span class="avatar">LC</span></div>
+        </header>
+
+        <div class="page-wrap" id="review">
+          <section class="page-heading">
+            <div>
+              <div class="eyebrow"><span class="eyebrow-line"></span> LABEL APPLICATION REVIEW</div>
+              <h1>Make the routine<br class="mobile-break" /> checks count.</h1>
+              <p class="heading-copy">Compare an application with its label artwork. We’ll read the image and flag details for your review.</p>
+            </div>
+            <div class="step-indicator"><span class="step-number">01</span><span class="step-divider"></span><span>APPLICATION<br />DETAILS</span><span class="step-divider"></span><span class="step-number faded">02</span><span class="step-divider"></span><span class="faded">LABEL<br />CHECK</span></div>
+          </section>
+
+          <section class="review-grid">
+            <div class="panel application-panel">
+              <div class="panel-header">
+                <div class="panel-title-group"><span class="section-index">01</span><div><h2>Application details</h2><p>Enter the information from the application.</p></div></div>
+                <button class="text-button" type="button" id="clear-form">Clear</button>
+              </div>
+              <form id="application-form" autocomplete="off">
+                <div class="field"><label for="brand">Brand name <span class="required">*</span></label><input id="brand" name="brand" placeholder="e.g. OLD TOM DISTILLERY" required /><span class="field-hint">The name as it appears in the application</span></div>
+                <div class="field"><label for="classType">Class / type <span class="required">*</span></label><input id="classType" name="classType" placeholder="e.g. Kentucky Straight Bourbon Whiskey" required /></div>
+                <div class="field-row">
+                  <div class="field"><label for="abv">Alcohol content <span class="required">*</span></label><div class="input-suffix"><input id="abv" name="abv" inputmode="decimal" placeholder="45" required /><span>% ABV</span></div></div>
+                  <div class="field"><label for="netContents">Net contents</label><input id="netContents" name="netContents" placeholder="e.g. 750 mL" /></div>
+                </div>
+                <div class="standard-notice"><span class="notice-check">✓</span><span>We check the warning against the TTB standard and flag visual requirements for review.</span></div>
+                <button class="primary-button" type="submit"><span>Check label artwork</span><span class="button-arrow">→</span></button>
+                <p class="form-footnote"><span class="tiny-lock">⌑</span> Nothing is uploaded. Image reading runs in your browser.</p>
+              </form>
+            </div>
+
+            <div class="right-column">
+              <div class="panel upload-panel">
+                <div class="panel-header upload-header">
+                  <div class="panel-title-group"><span class="section-index">02</span><div><h2>Label artwork</h2><p>Add one image or a batch to review.</p></div></div>
+                  <span class="optional-tag">UP TO 20</span>
+                </div>
+                <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" multiple hidden />
+                <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Choose or drop label images">
+                  <div class="upload-symbol"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 21V5m0 0-6 6m6-6 6 6M6 19v7h20v-7" /></svg></div>
+                  <strong>Drop label images here</strong>
+                  <span>or <button type="button" class="inline-choose" id="choose-files">browse files</button></span>
+                  <small>PNG, JPG, or WEBP · up to 15 MB each</small>
+                </div>
+                <div class="file-list" id="file-list" aria-live="polite"></div>
+                <div class="upload-footer"><span class="image-count" id="image-count">No images added</span><button class="text-button clear-files" type="button" id="clear-files" hidden>Remove all</button></div>
+              </div>
+
+              <div class="results-panel" id="results-panel" aria-live="polite" hidden>
+                <div class="results-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> REVIEW RESULTS</div><h2 id="results-title">Checks complete</h2></div><span class="results-summary" id="results-summary"></span></div>
+                <div id="results-list" class="results-list"></div>
+                <div class="review-disclaimer"><span>ⓘ</span><p>OCR can misread label text. Confirm each flag against the artwork. This prototype does not determine regulatory compliance.</p></div>
+              </div>
+
+              <div class="info-card" id="how-it-works"><span class="info-spark">✳</span><div><strong>A second set of eyes, not the final word.</strong><p>Text recognition checks the official warning and common label details. Bold type, size, contrast, and separation need a visual check.</p><a href="https://www.ttb.gov/regulated-commodities/beverage-alcohol/distilled-spirits/ds-labeling-home/ds-health-warning" target="_blank" rel="noreferrer">TTB health warning guidance <span>↗</span></a></div></div>
+            </div>
+          </section>
+          <footer class="page-footer"><span>LABELCHECK <span class="footer-sep">/</span> PROTOTYPE</span><span>Built for thoughtful review <span class="footer-star">✳</span></span></footer>
+        </div>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
