@@ -10,9 +10,19 @@
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
-    <script src="app.js" defer></script>
+    <script type="module" src="./app.js"></script>
+    <script>
+      window.setTimeout(() => {
+        if (window.labelCheckReady) return;
+        const notice = document.querySelector("#startup-error");
+        if (notice) notice.hidden = false;
+      }, 1500);
+    </script>
   </head>
   <body>
+    <div class="startup-error" id="startup-error" role="alert" hidden>
+      The app scripts did not load. Start the app with <code>npm run dev</code> and open the local address it prints.
+    </div>
     <div class="app-shell">
       <aside class="sidebar">
         <a class="wordmark" href="#top" aria-label="LabelCheck home">
@@ -58,9 +68,10 @@
                 <div class="field"><label for="classType">Class / type <span class="required">*</span></label><input id="classType" name="classType" placeholder="e.g. Kentucky Straight Bourbon Whiskey" required /></div>
                 <div class="field-row">
                   <div class="field"><label for="abv">Alcohol content <span class="required">*</span></label><div class="input-suffix"><input id="abv" name="abv" inputmode="decimal" placeholder="45" required /><span>% ABV</span></div></div>
-                  <div class="field"><label for="netContents">Net contents</label><input id="netContents" name="netContents" placeholder="e.g. 750 mL" /></div>
+                  <div class="field"><label for="proof">Proof <span class="optional-label">(optional)</span></label><div class="input-suffix"><input id="proof" name="proof" inputmode="decimal" placeholder="e.g. 90" /><span>proof</span></div></div>
                 </div>
-                <div class="standard-notice"><span class="notice-check">✓</span><span>We check the warning against the TTB standard and flag visual requirements for review.</span></div>
+                <div class="field"><label for="netContents">Net contents <span class="optional-label">(optional)</span></label><input id="netContents" name="netContents" placeholder="e.g. 750 mL" /></div>
+                <div class="standard-notice"><span class="notice-check">✓</span><span>We compare warning wording and automatically assess paragraph layout, heading weight, and contrast from the photos.</span></div>
                 <button class="primary-button" type="submit"><span>Check label artwork</span><span class="button-arrow">→</span></button>
                 <p class="form-footnote"><span class="tiny-lock">⌑</span> Nothing is uploaded. Image reading runs in your browser.</p>
               </form>
@@ -69,27 +80,27 @@
             <div class="right-column">
               <div class="panel upload-panel">
                 <div class="panel-header upload-header">
-                  <div class="panel-title-group"><span class="section-index">02</span><div><h2>Label artwork</h2><p>Add one image or a batch to review.</p></div></div>
+                  <div class="panel-title-group"><span class="section-index">02</span><div><h2>Label artwork</h2><p>Add front, back, and side photos to build one checklist.</p></div></div>
                   <span class="optional-tag">UP TO 20</span>
                 </div>
-                <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" multiple hidden />
-                <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Choose or drop label images">
+                <label class="drop-zone" id="drop-zone">
+                  <input type="file" id="file-input" class="file-picker-input" accept="image/*" multiple />
                   <div class="upload-symbol"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 21V5m0 0-6 6m6-6 6 6M6 19v7h20v-7" /></svg></div>
-                  <strong>Drop label images here</strong>
-                  <span>or <button type="button" class="inline-choose" id="choose-files">browse files</button></span>
-                  <small>PNG, JPG, or WEBP · up to 15 MB each</small>
-                </div>
+                  <strong>Drop full label photos here</strong>
+                  <span>or <strong class="inline-choose">browse files</strong></span>
+                  <small>Image formats supported by your browser · up to 15 MB each · no cropping needed</small>
+                </label>
                 <div class="file-list" id="file-list" aria-live="polite"></div>
                 <div class="upload-footer"><span class="image-count" id="image-count">No images added</span><button class="text-button clear-files" type="button" id="clear-files" hidden>Remove all</button></div>
               </div>
 
               <div class="results-panel" id="results-panel" aria-live="polite" hidden>
-                <div class="results-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> REVIEW RESULTS</div><h2 id="results-title">Checks complete</h2></div><span class="results-summary" id="results-summary"></span></div>
+                <div class="results-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> REVIEW RESULTS</div><h2 id="results-title">Checks complete</h2></div><div class="results-actions"><span class="results-summary" id="results-summary"></span><button class="back-button" id="back-to-application" type="button">← Back to application</button></div></div>
                 <div id="results-list" class="results-list"></div>
-                <div class="review-disclaimer"><span>ⓘ</span><p>OCR can misread label text. Confirm each flag against the artwork. This prototype does not determine regulatory compliance.</p></div>
+                <div class="review-disclaimer"><span>ⓘ</span><p>Photo scans may miss or misread text. Confirm each flag against the artwork. This prototype does not determine regulatory compliance.</p></div>
               </div>
 
-              <div class="info-card" id="how-it-works"><span class="info-spark">✳</span><div><strong>A second set of eyes, not the final word.</strong><p>Text recognition checks the official warning and common label details. Bold type, size, contrast, and separation need a visual check.</p><a href="https://www.ttb.gov/regulated-commodities/beverage-alcohol/distilled-spirits/ds-labeling-home/ds-health-warning" target="_blank" rel="noreferrer">TTB health warning guidance <span>↗</span></a></div></div>
+              <div class="info-card" id="how-it-works"><span class="info-spark">✳</span><div><strong>Automated checks, with image limits.</strong><p>We compare the warning wording and estimate layout, heading weight, and contrast. Physical type size cannot be measured from an unscaled photo.</p><a href="https://www.ttb.gov/regulated-commodities/beverage-alcohol/distilled-spirits/ds-labeling-home/ds-health-warning" target="_blank" rel="noreferrer">TTB health warning guidance <span>↗</span></a></div></div>
             </div>
           </section>
           <footer class="page-footer"><span>LABELCHECK <span class="footer-sep">/</span> PROTOTYPE</span><span>Built for thoughtful review <span class="footer-star">✳</span></span></footer>
