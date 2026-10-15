@@ -9,8 +9,14 @@
   const resultsList = document.querySelector("#results-list");
   const checkButton = form.querySelector("button[type=submit]");
   const backButton = document.querySelector("#back-to-application");
+  const batchForm = document.querySelector("#batch-form");
+  const batchFileInput = document.querySelector("#batch-files");
+  const batchQueue = document.querySelector("#batch-queue");
+  const batchJobs = [];
+  let batchQueueRunning = false;
   let files = [];
   let toastTimeout;
+  const scanChecksCache = new WeakMap();
   let tesseractWorkerPromise;
   let tesseractWorker;
 
@@ -58,6 +64,147 @@
     resultsPanel.hidden = true;
     document.body.classList.remove("results-mode");
   });
+
+  const singleTab = document.querySelector("#single-tab");
+  const batchTab = document.querySelector("#batch-tab");
+  function selectMode(mode) {
+    const isBatch = mode === "batch";
+    document.querySelector("#individual-mode").hidden = isBatch;
+    document.querySelector("#batch-mode").hidden = !isBatch;
+    singleTab.classList.toggle("active", !isBatch);
+    batchTab.classList.toggle("active", isBatch);
+    singleTab.setAttribute("aria-selected", String(!isBatch));
+    batchTab.setAttribute("aria-selected", String(isBatch));
+    resultsPanel.hidden = true;
+    document.body.classList.remove("results-mode");
+  }
+  singleTab.addEventListener("click", () => selectMode("single"));
+  batchTab.addEventListener("click", () => selectMode("batch"));
+  batchFileInput.addEventListener("change", renderBatchFileNames);
+  document.querySelector("#batch-search").addEventListener("input", renderBatchQueue);
+  document.querySelector("#clear-batch-queue").addEventListener("click", () => {
+    if (batchQueueRunning) return;
+    batchJobs.splice(0);
+    renderBatchQueue();
+  });
+
+  batchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!batchForm.reportValidity()) return;
+    const selected = Array.from(batchFileInput.files || []).filter(isImageFile);
+    if (!selected.length) {
+      showToast("Add at least one image for this bottle.");
+      return;
+    }
+    if (selected.some((file) => file.size > 15 * 1024 * 1024)) {
+      showToast("Images must be 15 MB or smaller.");
+      return;
+    }
+    const application = Object.fromEntries(["brand", "classType", "abv", "proof", "netContents"]
+      .map((key) => [key, batchForm.elements.namedItem(key).value.trim()]));
+    batchJobs.push({ id: crypto.randomUUID(), application, files: selected.slice(0, 20), state: "queued" });
+    batchForm.reset();
+    renderBatchFileNames();
+    renderBatchQueue();
+    if (selected.length > 20) showToast("A bottle review can include up to 20 images.");
+    void processBatchQueue();
+  });
+
+  function renderBatchFileNames() {
+    const selected = Array.from(batchFileInput.files || []);
+    document.querySelector("#batch-file-names").textContent = selected.length
+      ? selected.map((file) => file.name).join(" · ")
+      : "No photos selected";
+  }
+
+  function renderBatchQueue() {
+    if (!batchJobs.length) {
+      batchQueue.replaceChildren();
+      const empty = document.createElement("p");
+      empty.className = "batch-empty";
+      empty.textContent = "Your queued bottle reviews will appear here.";
+      batchQueue.append(empty);
+    } else {
+      batchQueue.querySelector(".batch-empty")?.remove();
+    }
+    batchJobs.forEach((job, index) => {
+      if (!job.card) {
+        const card = document.createElement("article");
+        card.className = "batch-job panel";
+        const header = document.createElement("div");
+        header.className = "batch-job-header";
+        const details = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = job.application.brand;
+        const subtitle = document.createElement("span");
+        subtitle.textContent = `${job.application.classType} · ${job.files.length} photo${job.files.length === 1 ? "" : "s"}`;
+        details.append(title, subtitle);
+        const metadata = document.createElement("span");
+        metadata.textContent = [
+          job.application.abv && job.application.abv + "% ABV",
+          job.application.proof && job.application.proof + " proof",
+          job.application.netContents,
+        ].filter(Boolean).join(" · ");
+        details.append(metadata);
+        const state = document.createElement("span");
+        const actions = document.createElement("div");
+        actions.className = "batch-job-actions";
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "batch-toggle-checks";
+        toggle.textContent = "Show checks";
+        toggle.setAttribute("aria-expanded", "false");
+        toggle.addEventListener("click", () => {
+          job.checksExpanded = !job.checksExpanded;
+          output.hidden = !job.checksExpanded;
+          toggle.textContent = job.checksExpanded ? "Hide checks" : "Show checks";
+          toggle.setAttribute("aria-expanded", String(job.checksExpanded));
+        });
+        actions.append(state, toggle);
+        header.append(details, actions);
+        const output = document.createElement("div");
+        output.className = "batch-job-results results-list";
+        output.hidden = true;
+        card.append(header, output);
+        batchQueue.append(card);
+        job.card = card;
+        job.stateElement = state;
+        job.output = output;
+      } else if (!job.card.isConnected) {
+        batchQueue.append(job.card);
+      }
+      job.stateElement.className = `status-pill ${job.state === "complete" ? "pass" : job.state === "error" ? "issue" : "review"}`;
+      job.stateElement.textContent = job.state === "queued" ? `QUEUED ${index + 1}` : job.state === "running" ? "SCANNING" : job.state === "error" ? "NEEDS RETRY" : "COMPLETE";
+      const searchText = [...Object.values(job.application), ...job.files.map((file) => file.name)].join(" ").toLowerCase();
+      job.card.hidden = !searchText.includes(document.querySelector("#batch-search").value.trim().toLowerCase());
+    });
+    document.querySelector("#clear-batch-queue").hidden = !batchJobs.some((job) => job.state === "complete" || job.state === "error");
+  }
+
+  async function processBatchQueue() {
+    if (batchQueueRunning) return;
+    batchQueueRunning = true;
+    try {
+      for (const job of batchJobs) {
+        if (job.state !== "queued") continue;
+        job.state = "running";
+        renderBatchQueue();
+        await runReview(job.application, job.files, {
+          target: job.output,
+          onProgress: (imageIndex, imageTotal) => {
+            job.stateLabel = `Reading image ${imageIndex} of ${imageTotal}`;
+          },
+          onComplete: (error) => { job.state = error ? "error" : "complete"; },
+          showErrors: false,
+        });
+        job.state = job.state === "error" ? "error" : "complete";
+        renderBatchQueue();
+      }
+    } finally {
+      batchQueueRunning = false;
+      renderBatchQueue();
+    }
+  }
 
   ["dragenter", "dragover"].forEach((name) => dropZone.addEventListener(name, (event) => {
     event.preventDefault();
@@ -148,6 +295,10 @@
       proof: value("proof"),
       netContents: value("netContents"),
     };
+    if (batchQueueRunning) {
+      showToast("A queued bottle is being scanned. Please wait for the queue to finish.");
+      return;
+    }
     checkButton.disabled = true;
     backButton.disabled = true;
     checkButton.querySelector("span:first-child").textContent = "Preparing image reader…";
@@ -158,7 +309,23 @@
     document.querySelector("#results-summary").textContent = "Photos are read locally with an adaptive OCR pass.";
     document.querySelector("#review").scrollIntoView({ behavior: "smooth", block: "start" });
 
-    let worker;
+    await runReview(application, files.slice(), {
+      target: resultsList,
+      onProgress: (imageIndex, imageTotal) => {
+        checkButton.querySelector("span:first-child").textContent = `Reading image ${imageIndex} of ${imageTotal}…`;
+      },
+      onComplete: () => {
+        checkButton.disabled = false;
+        backButton.disabled = false;
+        checkButton.querySelector("span:first-child").textContent = "Check label artwork";
+      },
+      title: document.querySelector("#results-title"),
+      summary: document.querySelector("#results-summary"),
+    });
+  });
+
+  async function runReview(application, reviewFiles, options = {}) {
+    const target = options.target || resultsList;
     let paddleOcrPromise;
     const getPaddleOcr = () => {
       if (!paddleOcrPromise) {
@@ -174,56 +341,52 @@
       return paddleOcrPromise;
     };
     try {
-      worker = await getTesseractWorker();
+      const worker = await getTesseractWorker();
       const records = [];
       const completedScans = [];
-      for (let i = 0; i < files.length; i += 1) {
-        checkButton.querySelector("span:first-child").textContent = `Reading image ${i + 1} of ${files.length}…`;
-        const progressCard = renderProgressCard(files[i], i + 1, files.length);
+      for (let i = 0; i < reviewFiles.length; i += 1) {
+        options.onProgress?.(i + 1, reviewFiles.length);
+        const progressCard = renderProgressCard(reviewFiles[i], i + 1, reviewFiles.length, target);
         const finishProgress = startProgressAnimation(progressCard);
         try {
           const photoStartedAt = performance.now();
-          const scans = await readPhoto(worker, files[i], application, getPaddleOcr, completedScans, (currentScans) => {
-            renderResults(
-              [...records, { file: files[i], scans: currentScans }],
-              application,
-              { preliminary: true, progressCard },
-            );
+          const scans = await readPhoto(worker, reviewFiles[i], application, getPaddleOcr, completedScans, (currentScans) => {
+            renderResults([...records, { file: reviewFiles[i], scans: currentScans }], application,
+              { preliminary: true, progressCard, target, title: options.title, summary: options.summary });
           });
-          records.push({ file: files[i], scans });
+          records.push({ file: reviewFiles[i], scans });
           completedScans.push(...scans);
-          console.info(`[LabelCheck timing] ${files[i].name}: ${Math.round(performance.now() - photoStartedAt)} ms total; ${scans.length} OCR results`);
+          console.info(`[LabelCheck timing] ${reviewFiles[i].name}: ${Math.round(performance.now() - photoStartedAt)} ms total; ${scans.length} OCR results`);
           finishProgress(true);
         } catch (error) {
           finishProgress(false);
           throw error;
         }
       }
-      renderResults(records, application);
+      renderResults(records, application, { target, title: options.title, summary: options.summary });
+      options.onComplete?.(null);
     } catch (error) {
       console.error("OCR failed", error);
-      document.querySelector("#results-title").textContent = "Text reading needs another try";
-      document.querySelector("#results-summary").textContent = "No checks could be completed.";
-      resultsList.replaceChildren();
-      showToast("We couldn't read the image. Try a clearer photo or a smaller file.");
+      if (options.title) options.title.textContent = "Text reading needs another try";
+      if (options.summary) options.summary.textContent = "No checks could be completed.";
+      target.replaceChildren();
+      if (options.showErrors !== false) showToast("We couldn't read the image. Try a clearer photo or a smaller file.");
+      options.onComplete?.(error);
     } finally {
       if (paddleOcrPromise) {
         const paddleOcr = await paddleOcrPromise;
         if (paddleOcr) await paddleOcr.dispose();
       }
-      checkButton.disabled = false;
-      backButton.disabled = false;
-      checkButton.querySelector("span:first-child").textContent = "Check label artwork";
     }
-  });
+  }
 
-  function renderProgressCard(file, index, total) {
+  function renderProgressCard(file, index, total, target = resultsList) {
     const card = document.createElement("article");
     card.className = "result-card loading-card";
     card.innerHTML = `<div class="result-card-head"><div class="result-file"><img alt=""><strong></strong></div><span class="results-summary">Reading ${index} of ${total}</span></div><div class="progress-wrap"><div class="progress-bar" style="width:0%"></div></div><div class="progress-text">Preparing image reader…</div>`;
     card.querySelector("img").src = URL.createObjectURL(file);
     card.querySelector("strong").textContent = file.name;
-    resultsList.append(card);
+    target.append(card);
     return card;
   }
 
@@ -252,7 +415,8 @@
   }
 
   function renderResults(records, application, options = {}) {
-    resultsList.replaceChildren();
+    const target = options.target || resultsList;
+    target.replaceChildren();
     const checks = combinePhotoChecks(records, application);
     const outcome = checks.some((check) => check.state === "issue") ? "issue" : checks.some((check) => check.state === "review") ? "review" : "pass";
     const allScans = records.flatMap(({ file, scans }) => scans.map((scan) => ({ ...scan, fileName: file.name })));
@@ -285,10 +449,10 @@
       note.textContent = "Preliminary checklist. It updates as additional scans discover and confirm information.";
       card.insertBefore(note, list);
     }
-    resultsList.append(card);
-    if (options.preliminary && options.progressCard) resultsList.append(options.progressCard);
-    document.querySelector("#results-title").textContent = options.preliminary ? "Initial label read" : "Combined label checklist";
-    document.querySelector("#results-summary").textContent = options.preliminary
+    target.append(card);
+    if (options.preliminary && options.progressCard) target.append(options.progressCard);
+    if (options.title) options.title.textContent = options.preliminary ? "Initial label read" : "Combined label checklist";
+    if (options.summary) options.summary.textContent = options.preliminary
       ? `${allScans.length} scan${allScans.length === 1 ? "" : "s"} read so far · checks are continuing.`
       : `One checklist across ${records.length} submitted photo${records.length === 1 ? "" : "s"}`;
   }
@@ -483,7 +647,7 @@
 
     const curvature = estimateTextCurvature(preferredBlocks, preferredImage.width, preferredImage.height);
     if (curvature !== null) {
-      const flattened = flattenCurvedPhoto(preferredImage, curvature);
+      const flattened = await flattenCurvedPhoto(preferredImage, curvature);
       const flattenedResult = await worker.recognize(flattened);
       addScan({
         name: "curvature adjusted full photo",
@@ -553,7 +717,7 @@
   }
 
   async function appendWarningCrop(worker, file, enhancedResult, enhanced, application, scans, batchScans = [], onScan = (scan) => scans.push(scan)) {
-    const warningWordingRead = [...batchScans, ...scans].some((scan) => compareText(scan.text, application)
+    const warningWordingRead = [...batchScans, ...scans].some((scan) => checksForScan(scan, application)
       .some((check) => check.label === "Warning wording" && check.state === "pass"));
     if (warningWordingRead || scans.some((scan) => scan.name === "enlarged warning block")) return;
     const cropStartedAt = performance.now();
@@ -1006,6 +1170,7 @@
       const pixels = context.getImageData(0, 0, crop.width, crop.height);
       const histogram = new Uint32Array(256);
       for (let i = 0; i < pixels.data.length; i += 4) {
+        if (i > 0 && i % 1_048_576 === 0) await yieldToBrowser();
         const gray = Math.round(0.299 * pixels.data[i] + 0.587 * pixels.data[i + 1] + 0.114 * pixels.data[i + 2]);
         pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = gray;
         histogram[gray] += 1;
@@ -1025,6 +1190,7 @@
       }
       const range = Math.max(1, high - low);
       for (let i = 0; i < pixels.data.length; i += 4) {
+        if (i > 0 && i % 1_048_576 === 0) await yieldToBrowser();
         const value = Math.max(0, Math.min(255, ((pixels.data[i] - low) / range) * 255));
         pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = value;
       }
@@ -1089,10 +1255,9 @@
   }
 
   function keyEvidenceCount(text, application) {
-    const flat = comparable(text);
     let count = 0;
-    if (brandCandidates(application.brand, application.classType).some((candidate) => flat.includes(comparable(candidate.text)))) count += 1;
-    if (application.classType && flat.includes(comparable(application.classType))) count += 1;
+    if (brandCandidates(application.brand, application.classType).some((candidate) => matchesExpectedPhrase(text, candidate.text))) count += 1;
+    if (application.classType && matchesExpectedPhrase(text, application.classType)) count += 1;
     if (application.abv && confirmsAbv(text, application.abv)) count += 1;
     return count;
   }
@@ -1108,7 +1273,7 @@
     ];
     if (application.proof) required.push("Proof");
     if (application.netContents) required.push("Net contents");
-    const checks = scans.map((scan) => compareText(scan.text, application));
+    const checks = scans.map((scan) => checksForScan(scan, application));
     const fieldsFound = required.every((label) => checks.some((items) => items.some((check) =>
       check.label === label && check.state === "pass")));
     if (!fieldsFound) return false;
@@ -1126,7 +1291,7 @@
     const required = ["Brand name", "Class / type", "Alcohol content", "Alcohol statement wording"];
     if (application.proof) required.push("Proof");
     if (application.netContents) required.push("Net contents");
-    const checks = scans.map((scan) => compareText(scan.text, application));
+    const checks = scans.map((scan) => checksForScan(scan, application));
     if (!required.every((label) => checks.some((items) => items.some((check) =>
       check.label === label && check.state === "pass")))) return false;
     return !application.proof || scans.some((scan) => hasExpectedAlcoholAndProof(scan.text, application)
@@ -1135,7 +1300,7 @@
 
   function hasWarningTextEvidence(scans, application) {
     return ["Warning heading", "Warning wording"].every((label) => scans.some((scan) =>
-      compareText(scan.text, application).some((check) => check.label === label && check.state === "pass")));
+      checksForScan(scan, application).some((check) => check.label === label && check.state === "pass")));
   }
 
   function isAlcoholEvidenceMissing(scans, application) {
@@ -1175,7 +1340,7 @@
     return centerBend >= 7 && centerBend <= imageHeight * 0.06 ? curvature : null;
   }
 
-  function flattenCurvedPhoto(image, curvature) {
+  async function flattenCurvedPhoto(image, curvature) {
     const sourceContext = image.getContext("2d", { willReadFrequently: true });
     const source = sourceContext.getImageData(0, 0, image.width, image.height);
     const flattened = document.createElement("canvas");
@@ -1183,11 +1348,9 @@
     flattened.height = image.height;
     const context = flattened.getContext("2d", { willReadFrequently: true });
     const output = context.createImageData(image.width, image.height);
-    for (let i = 0; i < output.data.length; i += 4) {
-      output.data[i] = output.data[i + 1] = output.data[i + 2] = 255;
-      output.data[i + 3] = 255;
-    }
+    output.data.fill(255);
     for (let x = 0; x < image.width; x += 1) {
+      if (x > 0 && x % 24 === 0) await yieldToBrowser();
       const u = x / Math.max(1, image.width - 1);
       const sourceOffset = Math.round(-curvature * u * (1 - u));
       for (let y = 0; y < image.height; y += 1) {
@@ -1230,6 +1393,7 @@
     const pixels = context.getImageData(0, 0, width, height);
     const histogram = new Uint32Array(256);
     for (let i = 0; i < pixels.data.length; i += 4) {
+      if (i > 0 && i % 1_048_576 === 0) await yieldToBrowser();
       const gray = Math.round(0.299 * pixels.data[i] + 0.587 * pixels.data[i + 1] + 0.114 * pixels.data[i + 2]);
       pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = gray;
       histogram[gray] += 1;
@@ -1249,11 +1413,16 @@
     }
     const range = Math.max(1, high - low);
     for (let i = 0; i < pixels.data.length; i += 4) {
+      if (i > 0 && i % 1_048_576 === 0) await yieldToBrowser();
       const adjusted = Math.max(0, Math.min(255, ((pixels.data[i] - low) / range) * 255));
       pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = adjusted;
     }
     context.putImageData(pixels, 0, 0);
     return { original, enhanced };
+  }
+
+  function yieldToBrowser() {
+    return new Promise((resolve) => window.setTimeout(resolve, 0));
   }
 
   function makeOverlappingTiles(image) {
@@ -1282,18 +1451,17 @@
   }
 
   function scanScore(scan, application) {
-    const flat = comparable(scan.text);
     let evidence = 0;
     [application.classType].filter(Boolean).forEach((expected) => {
-      if (flat.includes(comparable(expected))) evidence += 12;
+      if (matchesExpectedPhrase(scan.text, expected)) evidence += 12;
     });
-    if (brandCandidates(application.brand, application.classType).some((candidate) => flat.includes(comparable(candidate.text)))) evidence += 12;
+    if (brandCandidates(application.brand, application.classType).some((candidate) => matchesExpectedPhrase(scan.text, candidate.text))) evidence += 12;
     if (/government\s+warning/i.test(scan.text)) evidence += 12;
     return scan.confidence + evidence;
   }
 
   function compareScans(scans, application) {
-    const allChecks = scans.map((scan) => compareText(scan.text, application));
+    const allChecks = scans.map((scan) => checksForScan(scan, application));
     const labels = allChecks[0].map((check) => check.label);
     return labels.map((label, index) => {
       if (label === "Warning format") {
@@ -1322,6 +1490,14 @@
       return readableCandidates.find(({ check }) => check.state === "review")?.check
         || (readableCandidates[0]?.check || { label, state: "review", value: "OCR confidence was too low to assess this text — verify on artwork" });
     });
+  }
+
+  function checksForScan(scan, application) {
+    const cached = scanChecksCache.get(scan);
+    if (cached?.application === application) return cached.checks;
+    const checks = compareText(scan.text, application);
+    scanChecksCache.set(scan, { application, checks });
+    return checks;
   }
 
   function combinePhotoChecks(records, application) {
@@ -1495,7 +1671,8 @@
     const results = [];
     const matching = (label, expected, matchedText, acceptedValues = [{ text: expected, isTypeSuffix: false }]) => {
       if (!expected.trim()) return;
-      const found = acceptedValues.find((candidate) => comparable(candidate.text) && flat.includes(comparable(candidate.text)));
+      const found = acceptedValues.find((candidate) => comparable(candidate.text)
+        && (flat.includes(comparable(candidate.text)) || matchesExpectedPhrase(text, candidate.text)));
       // OCR may insert one character into a long class line (for example
       // “STRAIGHT” -> “STRIAIGHT”). Accept only a near-exact full-field match;
       // fuzzy matching is deliberately limited to class/type to avoid making
@@ -1717,36 +1894,36 @@
   }
   function comparable(value) { return String(value).toLowerCase().replace(/[^a-z0-9]+/g, ""); }
 
+  function matchesExpectedPhrase(text, expected) {
+    const expectedWords = String(expected || "").toLowerCase().match(/[a-z0-9]+/g) || [];
+    const actualWords = String(text || "").toLowerCase().match(/[a-z0-9]+/g) || [];
+    if (!expectedWords.length || !actualWords.length) return false;
+    const available = actualWords.slice();
+    return expectedWords.every((word) => {
+      const exactIndex = available.indexOf(word);
+      if (exactIndex >= 0) {
+        available.splice(exactIndex, 1);
+        return true;
+      }
+      const limit = word.length >= 6 ? 1 : 0;
+      const approximateIndex = limit ? available.findIndex((candidate) => editDistanceWithin(candidate, word, limit) !== null) : -1;
+      if (approximateIndex < 0) return false;
+      available.splice(approximateIndex, 1);
+      return true;
+    });
+  }
+
   function findNearExactMatch(text, expected) {
     if (expected.length < 15) return false;
     const maxDistance = Math.max(1, Math.floor(expected.length * 0.04));
     for (let length = expected.length - maxDistance; length <= expected.length + maxDistance; length += 1) {
       for (let start = 0; start + length <= text.length; start += 1) {
-        if (editDistanceAtMost(text.slice(start, start + length), expected, maxDistance)) return true;
+        if (editDistanceWithin(text.slice(start, start + length), expected, maxDistance) !== null) return true;
       }
     }
     return false;
   }
 
-  function editDistanceAtMost(left, right, limit) {
-    if (Math.abs(left.length - right.length) > limit) return false;
-    let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-    for (let row = 1; row <= left.length; row += 1) {
-      const current = [row];
-      let rowMinimum = row;
-      for (let column = 1; column <= right.length; column += 1) {
-        current[column] = Math.min(
-          current[column - 1] + 1,
-          previous[column] + 1,
-          previous[column - 1] + (left[row - 1] === right[column - 1] ? 0 : 1),
-        );
-        rowMinimum = Math.min(rowMinimum, current[column]);
-      }
-      if (rowMinimum > limit) return false;
-      previous = current;
-    }
-    return previous[right.length] <= limit;
-  }
   function warningTextMatches(actual, expected) {
     const found = comparable(actual);
     const target = comparable(expected);
@@ -1757,14 +1934,14 @@
     const maxLength = Math.min(found.length, target.length + maxEdits);
     for (let length = minLength; length <= maxLength; length += 1) {
       for (let start = 0; start + length <= found.length; start += 1) {
-        if (editDistanceAtMost(found.slice(start, start + length), target, maxEdits) <= maxEdits) return true;
+        if (editDistanceWithin(found.slice(start, start + length), target, maxEdits) !== null) return true;
       }
     }
     return false;
   }
 
-  function editDistanceAtMost(left, right, cutoff) {
-    if (Math.abs(left.length - right.length) > cutoff) return cutoff + 1;
+  function editDistanceWithin(left, right, limit) {
+    if (Math.abs(left.length - right.length) > limit) return null;
     let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
     for (let i = 1; i <= left.length; i += 1) {
       const current = [i];
@@ -1773,10 +1950,10 @@
         current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
         rowMin = Math.min(rowMin, current[j]);
       }
-      if (rowMin > cutoff) return cutoff + 1;
+      if (rowMin > limit) return null;
       previous = current;
     }
-    return previous[right.length];
+    return previous[right.length] <= limit ? previous[right.length] : null;
   }
   function value(id) { return document.getElementById(id).value.trim(); }
   function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }

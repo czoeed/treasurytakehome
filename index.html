@@ -48,6 +48,11 @@
         </header>
 
         <div class="page-wrap" id="review">
+          <div class="mode-tabs" role="tablist" aria-label="Review mode">
+            <button class="mode-tab active" id="single-tab" type="button" role="tab" aria-selected="true" aria-controls="individual-mode">Individual review</button>
+            <button class="mode-tab" id="batch-tab" type="button" role="tab" aria-selected="false" aria-controls="batch-mode">Batch queue</button>
+          </div>
+          <div id="individual-mode">
           <section class="page-heading">
             <div>
               <div class="eyebrow"><span class="eyebrow-line"></span> LABEL APPLICATION REVIEW</div>
@@ -101,6 +106,24 @@
               </div>
 
               <div class="info-card" id="how-it-works"><span class="info-spark">✳</span><div><strong>Automated checks, with image limits.</strong><p>We compare the warning wording and estimate layout, heading weight, and contrast. Physical type size cannot be measured from an unscaled photo.</p><a href="https://www.ttb.gov/regulated-commodities/beverage-alcohol/distilled-spirits/ds-labeling-home/ds-health-warning" target="_blank" rel="noreferrer">TTB health warning guidance <span>↗</span></a></div></div>
+            </div>
+          </section>
+          </div>
+          <section class="batch-mode" id="batch-mode" role="tabpanel" aria-labelledby="batch-tab" hidden>
+            <div class="page-heading batch-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> BATCH LABEL REVIEW</div><h1>Queue bottle reviews.</h1><p class="heading-copy">Add each application with its own label photos. Reviews start as soon as they are queued and run one at a time.</p></div></div>
+            <div class="review-grid">
+              <div class="panel application-panel">
+                <div class="panel-header"><div class="panel-title-group"><span class="section-index">01</span><div><h2>Next application</h2><p>Each queued bottle gets a separate checklist.</p></div></div></div>
+                <form id="batch-form" autocomplete="off">
+                  <div class="field"><label for="batch-brand">Brand name <span class="required">*</span></label><input id="batch-brand" name="brand" required /></div>
+                  <div class="field"><label for="batch-class">Class / type <span class="required">*</span></label><input id="batch-class" name="classType" required /></div>
+                  <div class="field-row"><div class="field"><label for="batch-abv">Alcohol content <span class="required">*</span></label><div class="input-suffix"><input id="batch-abv" name="abv" inputmode="decimal" required /><span>% ABV</span></div></div><div class="field"><label for="batch-proof">Proof <span class="optional-label">(optional)</span></label><div class="input-suffix"><input id="batch-proof" name="proof" inputmode="decimal" /><span>proof</span></div></div></div>
+                  <div class="field"><label for="batch-net">Net contents <span class="optional-label">(optional)</span></label><input id="batch-net" name="netContents" /></div>
+                  <div class="field"><label for="batch-files">Bottle photos <span class="required">*</span></label><input class="batch-file-input" id="batch-files" type="file" accept="image/*" multiple required /><span class="field-hint">Add front, back, and side views for this bottle.</span><div class="batch-file-names" id="batch-file-names">No photos selected</div></div>
+                  <button class="primary-button" type="submit"><span>Add to queue</span><span class="button-arrow">＋</span></button>
+                </form>
+              </div>
+              <div class="right-column"><div class="batch-queue-heading"><h2>Review queue</h2><button class="text-button clear-files" id="clear-batch-queue" type="button" hidden>Clear finished reviews</button></div><label class="batch-search-label" for="batch-search">Search applications</label><input class="batch-search" id="batch-search" type="search" placeholder="Brand, class/type, ABV, or photo name" autocomplete="off" /><div class="batch-queue" id="batch-queue" aria-live="polite"><p class="batch-empty">Your queued bottle reviews will appear here.</p></div></div>
             </div>
           </section>
           <footer class="page-footer"><span>TTB LABELCHECK <span class="footer-sep">/</span> INDEPENDENT PROTOTYPE</span><span>Not affiliated with or endorsed by TTB</span></footer>
