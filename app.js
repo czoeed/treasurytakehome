@@ -11,6 +11,34 @@
   const backButton = document.querySelector("#back-to-application");
   let files = [];
   let toastTimeout;
+  let tesseractWorkerPromise;
+  let tesseractWorker;
+
+  function getTesseractWorker() {
+    if (!tesseractWorkerPromise) {
+      const startedAt = performance.now();
+      tesseractWorkerPromise = (async () => {
+        const worker = await Tesseract.createWorker("eng", 1, { logger: updateProgress });
+        await worker.setParameters({
+          tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+          preserve_interword_spaces: "1",
+        });
+        tesseractWorker = worker;
+        console.info(`[LabelCheck timing] Tesseract worker initialized in ${Math.round(performance.now() - startedAt)} ms`);
+        return worker;
+      })().catch((error) => {
+        tesseractWorkerPromise = null;
+        throw error;
+      });
+    }
+    return tesseractWorkerPromise;
+  }
+
+  window.addEventListener("pagehide", () => {
+    if (tesseractWorker) void tesseractWorker.terminate();
+    tesseractWorker = null;
+    tesseractWorkerPromise = null;
+  });
 
   document.querySelector("#clear-form").addEventListener("click", () => {
     form.reset();
@@ -49,6 +77,10 @@
     const seen = new Set(files.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
     files = [...files, ...acceptable.filter((file) => !seen.has(`${file.name}:${file.size}:${file.lastModified}`))].slice(0, 20);
     renderFiles();
+    if (incoming.length && window.Tesseract) {
+      // Load OCR while the user enters application details, instead of after submit.
+      void getTesseractWorker().catch((error) => console.warn("Could not warm the OCR worker", error));
+    }
     if (tooLarge.length) showToast("Images must be 15 MB or smaller.");
     else if (selected.length && !incoming.length) showToast("Choose an image file in a format supported by your browser.");
     else if (files.length === 20 && acceptable.length) showToast("You can review up to 20 images at a time.");
@@ -104,15 +136,6 @@
       dropZone.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
-    for (const file of files) {
-      try {
-        const bitmap = await createImageBitmap(file);
-        bitmap.close();
-      } catch (error) {
-        showToast(`This browser can't read ${file.name}. Save or export it as a JPG or PNG.`);
-        return;
-      }
-    }
     if (!window.Tesseract) {
       showToast("Text recognition did not load. Check your internet connection and reload.");
       return;
@@ -132,28 +155,49 @@
     document.body.classList.add("results-mode");
     resultsList.replaceChildren();
     document.querySelector("#results-title").textContent = "Reading label artwork";
-    document.querySelector("#results-summary").textContent = "Photos are read locally by two OCR engines and several image passes.";
+    document.querySelector("#results-summary").textContent = "Photos are read locally with an adaptive OCR pass.";
     document.querySelector("#review").scrollIntoView({ behavior: "smooth", block: "start" });
 
     let worker;
-    let paddleOcr;
-    try {
-      worker = await Tesseract.createWorker("eng", 1, { logger: (message) => updateProgress(message) });
-      await worker.setParameters({
-        tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
-        preserve_interword_spaces: "1",
-      });
-      try {
-        paddleOcr = await createPaddleOcr();
-      } catch (error) {
-        console.warn("PaddleOCR could not initialize; continuing with Tesseract", error);
+    let paddleOcrPromise;
+    const getPaddleOcr = () => {
+      if (!paddleOcrPromise) {
+        const startedAt = performance.now();
+        paddleOcrPromise = createPaddleOcr().then((engine) => {
+          console.info(`[LabelCheck timing] PaddleOCR initialized in ${Math.round(performance.now() - startedAt)} ms`);
+          return engine;
+        }).catch((error) => {
+          console.warn("PaddleOCR could not initialize; continuing with Tesseract", error);
+          return null;
+        });
       }
+      return paddleOcrPromise;
+    };
+    try {
+      worker = await getTesseractWorker();
       const records = [];
+      const completedScans = [];
       for (let i = 0; i < files.length; i += 1) {
         checkButton.querySelector("span:first-child").textContent = `Reading image ${i + 1} of ${files.length}…`;
-        renderProgressCard(files[i], i + 1, files.length);
-        const scans = await readPhoto(worker, files[i], application, paddleOcr);
-        records.push({ file: files[i], scans });
+        const progressCard = renderProgressCard(files[i], i + 1, files.length);
+        const finishProgress = startProgressAnimation(progressCard);
+        try {
+          const photoStartedAt = performance.now();
+          const scans = await readPhoto(worker, files[i], application, getPaddleOcr, completedScans, (currentScans) => {
+            renderResults(
+              [...records, { file: files[i], scans: currentScans }],
+              application,
+              { preliminary: true, progressCard },
+            );
+          });
+          records.push({ file: files[i], scans });
+          completedScans.push(...scans);
+          console.info(`[LabelCheck timing] ${files[i].name}: ${Math.round(performance.now() - photoStartedAt)} ms total; ${scans.length} OCR results`);
+          finishProgress(true);
+        } catch (error) {
+          finishProgress(false);
+          throw error;
+        }
       }
       renderResults(records, application);
     } catch (error) {
@@ -163,8 +207,10 @@
       resultsList.replaceChildren();
       showToast("We couldn't read the image. Try a clearer photo or a smaller file.");
     } finally {
-      if (worker) await worker.terminate();
-      if (paddleOcr) await paddleOcr.dispose();
+      if (paddleOcrPromise) {
+        const paddleOcr = await paddleOcrPromise;
+        if (paddleOcr) await paddleOcr.dispose();
+      }
       checkButton.disabled = false;
       backButton.disabled = false;
       checkButton.querySelector("span:first-child").textContent = "Check label artwork";
@@ -174,13 +220,38 @@
   function renderProgressCard(file, index, total) {
     const card = document.createElement("article");
     card.className = "result-card loading-card";
-    card.innerHTML = `<div class="result-card-head"><div class="result-file"><img alt=""><strong></strong></div><span class="results-summary">Reading ${index} of ${total}</span></div><div class="progress-wrap"><div class="progress-bar" style="width:${Math.round(index / total * 100)}%"></div></div><div class="progress-text">Your image is being read in this browser.</div>`;
+    card.innerHTML = `<div class="result-card-head"><div class="result-file"><img alt=""><strong></strong></div><span class="results-summary">Reading ${index} of ${total}</span></div><div class="progress-wrap"><div class="progress-bar" style="width:0%"></div></div><div class="progress-text">Preparing image reader…</div>`;
     card.querySelector("img").src = URL.createObjectURL(file);
     card.querySelector("strong").textContent = file.name;
     resultsList.append(card);
+    return card;
   }
 
-  function renderResults(records, application) {
+  function startProgressAnimation(card) {
+    const bar = card.querySelector(".progress-bar");
+    const text = card.querySelector(".progress-text");
+    const startedAt = performance.now();
+    const timer = window.setInterval(() => {
+      const elapsed = performance.now() - startedAt;
+      // Scan duration depends on image difficulty and the recovery passes it needs.
+      // Approach 94% gradually, then mark complete only after OCR actually returns.
+      const progress = Math.min(94, 4 + 90 * (1 - Math.exp(-elapsed / 18000)));
+      bar.style.width = `${progress.toFixed(1)}%`;
+      if (elapsed > 500) text.textContent = "Reading label text…";
+      if (elapsed > 12000) text.textContent = "Checking details across image regions…";
+    }, 250);
+    return (complete) => {
+      window.clearInterval(timer);
+      if (complete) {
+        bar.style.width = "100%";
+        text.textContent = "Image read complete.";
+      } else {
+        text.textContent = "Image could not be read.";
+      }
+    };
+  }
+
+  function renderResults(records, application, options = {}) {
     resultsList.replaceChildren();
     const checks = combinePhotoChecks(records, application);
     const outcome = checks.some((check) => check.state === "issue") ? "issue" : checks.some((check) => check.state === "review") ? "review" : "pass";
@@ -197,8 +268,8 @@
     fileName.textContent = `${records.length} photo${records.length === 1 ? "" : "s"} combined`;
     fileInfo.append(fileName);
     const pill = document.createElement("span");
-    pill.className = `status-pill ${outcome}`;
-    pill.textContent = outcome === "pass" ? "NO TEXT FLAGS" : outcome === "issue" ? "CHECK FLAGS" : "MANUAL REVIEW";
+    pill.className = `status-pill ${options.preliminary ? "review" : outcome}`;
+    pill.textContent = options.preliminary ? "PRELIMINARY" : outcome === "pass" ? "NO TEXT FLAGS" : outcome === "issue" ? "CHECK FLAGS" : "MANUAL REVIEW";
     header.append(fileInfo, pill);
     const list = document.createElement("div");
     list.className = "check-list";
@@ -208,23 +279,55 @@
     extracted.innerHTML = `<summary>View recognized text · best scan ${Math.round(confidence)}% OCR confidence</summary><pre></pre>`;
     extracted.querySelector("pre").textContent = text.trim() || "No text could be read from this image.";
     card.append(header, list, extracted);
+    if (options.preliminary) {
+      const note = document.createElement("p");
+      note.className = "preliminary-note";
+      note.textContent = "Preliminary checklist. It updates as additional scans discover and confirm information.";
+      card.insertBefore(note, list);
+    }
     resultsList.append(card);
-    document.querySelector("#results-title").textContent = "Combined label checklist";
-    document.querySelector("#results-summary").textContent = `One checklist across ${records.length} submitted photo${records.length === 1 ? "" : "s"}`;
+    if (options.preliminary && options.progressCard) resultsList.append(options.progressCard);
+    document.querySelector("#results-title").textContent = options.preliminary ? "Initial label read" : "Combined label checklist";
+    document.querySelector("#results-summary").textContent = options.preliminary
+      ? `${allScans.length} scan${allScans.length === 1 ? "" : "s"} read so far · checks are continuing.`
+      : `One checklist across ${records.length} submitted photo${records.length === 1 ? "" : "s"}`;
   }
 
-  async function readPhoto(worker, file, application, paddleOcr) {
+  async function readPhoto(worker, file, application, getPaddleOcr, batchScans = [], onScanUpdate = null) {
+    const startedAt = performance.now();
+    const originalRecognize = worker.recognize;
+    let recognizeMs = 0;
+    let recognizeCount = 0;
+    worker.recognize = async function (...args) {
+      const recognizeStartedAt = performance.now();
+      try {
+        return await originalRecognize.apply(worker, args);
+      } finally {
+        recognizeMs += performance.now() - recognizeStartedAt;
+        recognizeCount += 1;
+      }
+    };
+    try {
+      return await readPhotoPipeline(worker, file, application, getPaddleOcr, batchScans, onScanUpdate);
+    } finally {
+      worker.recognize = originalRecognize;
+      const elapsedMs = performance.now() - startedAt;
+      console.info(`[LabelCheck timing] ${file.name}: ${Math.round(recognizeMs)} ms Tesseract across ${recognizeCount} passes; ${Math.round(elapsedMs - recognizeMs)} ms preparation, PaddleOCR, and other work`);
+    }
+  }
+
+  async function readPhotoPipeline(worker, file, application, getPaddleOcr, batchScans, onScanUpdate) {
+    const preparationStartedAt = performance.now();
     const { original, enhanced } = await preparePhoto(file);
+    console.info(`[LabelCheck timing] ${file.name}: image decode and preprocessing ${Math.round(performance.now() - preparationStartedAt)} ms`);
     const firstPasses = [];
+    const addScan = (scan) => {
+      firstPasses.push(scan);
+      onScanUpdate?.(firstPasses.slice());
+    };
     const paddleViews = [{ name: "PaddleOCR original photo", image: original }];
-    const originalResult = await worker.recognize(original);
-    firstPasses.push({
-      name: "original full photo",
-      text: originalResult.data.text || "",
-      confidence: originalResult.data.confidence ?? 0,
-    });
     const enhancedResult = await worker.recognize(enhanced, {}, { blocks: true });
-    firstPasses.push({
+    addScan({
       name: "contrast adjusted full photo",
       text: enhancedResult.data.text || "",
       confidence: enhancedResult.data.confidence ?? 0,
@@ -234,6 +337,43 @@
         enhancedResult.data.text || "",
       ),
     });
+
+    // Small warning print often needs a targeted crop, while the brand, class,
+    // alcohol values, and volume are already readable from the full photo.
+    // Try that inexpensive crop before paying for another full-image engine pass.
+    let triedEarlyWarningCrop = false;
+    if (hasBatchLabelDetailsEvidence(batchScans, firstPasses, application)
+      && !hasWarningTextEvidence([...batchScans, ...firstPasses], application)) {
+      await appendWarningCrop(worker, file, enhancedResult, enhanced, application, firstPasses, batchScans, addScan);
+      triedEarlyWarningCrop = true;
+    }
+
+    // The enhanced scan is usually enough for straight, well-lit label photos.
+    // Pay for a second full-photo recognition only when required evidence is missing.
+    if (!hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) {
+      const originalResult = await worker.recognize(original);
+      addScan({
+        name: "original full photo",
+        text: originalResult.data.text || "",
+        confidence: originalResult.data.confidence ?? 0,
+      });
+    }
+
+    let paddleOcr = null;
+    if (!hasBatchCoreFieldEvidence(batchScans, firstPasses, application) && getPaddleOcr) {
+      paddleOcr = await getPaddleOcr();
+      if (paddleOcr) {
+        try {
+          await appendPaddleResults(paddleOcr, paddleViews, firstPasses, 0, addScan);
+        } catch (error) {
+          console.warn("PaddleOCR failed on the original photo; continuing with other scans", error);
+        }
+      }
+    }
+    if (hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) {
+      await appendWarningCrop(worker, file, enhancedResult, enhanced, application, firstPasses, batchScans, addScan);
+      return firstPasses;
+    }
 
     // Keep a geometry-corrected label candidate alongside the normal photo
     // scans; downstream checks can use whichever view reads the text best.
@@ -246,31 +386,36 @@
         try {
           await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK });
           const perspectiveResult = await worker.recognize(perspectiveLabel);
-          firstPasses.push({
+          addScan({
             name: "perspective-corrected label",
             text: perspectiveResult.data.text || "",
             confidence: perspectiveResult.data.confidence ?? 0,
           });
 
-          const unwrappedLabel = unwrapCylindricalLabel(perspectiveLabel, 48);
-          paddleViews.push({ name: "PaddleOCR unwrapped label", image: unwrappedLabel });
-          const unwrappedResult = await worker.recognize(unwrappedLabel);
-          firstPasses.push({
-            name: "cylindrically unwrapped label",
-            text: unwrappedResult.data.text || "",
-            confidence: unwrappedResult.data.confidence ?? 0,
-          });
-
-          const bands = [[0, 0.42], [0.34, 0.78], [0.68, 1]];
-          for (let index = 0; index < bands.length; index += 1) {
-            const band = warpLabelBand(original, labelQuad, ...bands[index]);
-            paddleViews.push({ name: `PaddleOCR flattened label band ${index + 1}`, image: band });
-            const bandResult = await worker.recognize(band);
-            firstPasses.push({
-              name: `flattened label band ${index + 1}`,
-              text: bandResult.data.text || "",
-              confidence: bandResult.data.confidence ?? 0,
+          if (!hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) {
+            const unwrappedLabel = unwrapCylindricalLabel(perspectiveLabel, 48);
+            paddleViews.push({ name: "PaddleOCR unwrapped label", image: unwrappedLabel });
+            const unwrappedResult = await worker.recognize(unwrappedLabel);
+            addScan({
+              name: "cylindrically unwrapped label",
+              text: unwrappedResult.data.text || "",
+              confidence: unwrappedResult.data.confidence ?? 0,
             });
+          }
+
+          if (!hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) {
+            const bands = [[0, 0.42], [0.34, 0.78], [0.68, 1]];
+            for (let index = 0; index < bands.length; index += 1) {
+              const band = warpLabelBand(original, labelQuad, ...bands[index]);
+              paddleViews.push({ name: `PaddleOCR flattened label band ${index + 1}`, image: band });
+              const bandResult = await worker.recognize(band);
+              addScan({
+                name: `flattened label band ${index + 1}`,
+                text: bandResult.data.text || "",
+                confidence: bandResult.data.confidence ?? 0,
+              });
+              if (hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) break;
+            }
           }
         } finally {
           await worker.setParameters({ tessedit_pageseg_mode: previousMode });
@@ -280,22 +425,17 @@
       console.warn("Geometry corrected OCR pass failed; continuing with photo scans", error);
     }
 
-    if (paddleOcr && paddleViews.length) {
+    if (paddleOcr && paddleViews.length > 1) {
       try {
-        const paddleResults = await paddleOcr.predict(paddleViews.map(({ image }) => image));
-        paddleResults.forEach((result, index) => {
-          const items = result.items || [];
-          const scores = items.map((item) => item.score).filter(Number.isFinite);
-          firstPasses.push({
-            name: paddleViews[index].name,
-            text: orderPaddleText(items),
-            confidence: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length * 100 : 0,
-            engine: "paddle",
-          });
-        });
+        await appendPaddleResults(paddleOcr, paddleViews, firstPasses, 1, addScan);
       } catch (error) {
         console.warn("PaddleOCR failed for this image; keeping the other OCR scans", error);
       }
+    }
+
+    if (hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) {
+      await appendWarningCrop(worker, file, enhancedResult, enhanced, application, firstPasses, batchScans, addScan);
+      return firstPasses;
     }
 
     let preferredImage = enhanced;
@@ -311,7 +451,7 @@
         confidence: data.confidence ?? 0,
         warningFormat: analyzeWarningFormat(data.blocks || [], deskewed, data.text || ""),
       };
-      firstPasses.push(deskewScan);
+      addScan(deskewScan);
       if (scanScore(deskewScan, application) > scanScore(preferredScan, application)) {
         preferredImage = deskewed;
         preferredBlocks = data.blocks || [];
@@ -331,7 +471,7 @@
           confidence: data.confidence ?? 0,
           warningFormat: analyzeWarningFormat(data.blocks || [], rotated, data.text || ""),
         };
-        firstPasses.push(rotatedScan);
+        addScan(rotatedScan);
         if (scanScore(rotatedScan, application) > scanScore(preferredScan, application)) {
           preferredImage = rotated;
           preferredBlocks = data.blocks || [];
@@ -345,7 +485,7 @@
     if (curvature !== null) {
       const flattened = flattenCurvedPhoto(preferredImage, curvature);
       const flattenedResult = await worker.recognize(flattened);
-      firstPasses.push({
+      addScan({
         name: "curvature adjusted full photo",
         text: flattenedResult.data.text || "",
         confidence: flattenedResult.data.confidence ?? 0,
@@ -354,71 +494,89 @@
 
     // Whole-photo OCR is the normal path. If the warning or application details
     // were missed, scan overlapping sections so small print gets more pixels.
-    const bestWhole = firstPasses.slice().sort((a, b) => scanScore(b, application) - scanScore(a, application))[0];
-    const hasWarning = /government\s+warning/i.test(bestWhole.text);
-    const wholeText = comparable(bestWhole.text);
-    const hasBrand = !application.brand || brandCandidates(application.brand, application.classType)
-      .some((candidate) => wholeText.includes(comparable(candidate.text)));
-    const hasClass = !application.classType || wholeText.includes(comparable(application.classType));
-    const hasProof = !application.proof || confirmsProof(bestWhole.text, application.proof);
-    const netContents = comparable(application.netContents);
-    const hasNetContents = !netContents || wholeText.includes(netContents);
-    const needsDetailTiles = bestWhole.confidence < 78 || !hasWarning || !hasBrand || !hasClass || !hasProof || !hasNetContents;
+    const needsDetailTiles = !hasBatchCoreFieldEvidence(batchScans, firstPasses, application);
     if (needsDetailTiles) {
       // Detail regions inherit the best angle found for the full photo, while
       // sparse-text mode handles the multiple text clusters on bottle labels.
       const tiles = makeOverlappingTiles(preferredImage);
       for (let i = 0; i < tiles.length; i += 1) {
         const { data } = await worker.recognize(tiles[i]);
-        firstPasses.push({ name: `rotated detail area ${i + 1}`, text: data.text || "", confidence: data.confidence ?? 0 });
+        addScan({ name: `rotated detail area ${i + 1}`, text: data.text || "", confidence: data.confidence ?? 0 });
+        if (hasBatchCoreFieldEvidence(batchScans, firstPasses, application)) break;
       }
-
     }
-    const missingAbv = application.abv && !firstPasses.some((scan) => confirmsAbv(scan.text, application.abv));
-    const missingProof = application.proof && !firstPasses.some((scan) => confirmsProof(scan.text, application.proof));
-    if (missingAbv || missingProof) {
+    if (isAlcoholEvidenceMissing(firstPasses, application)) {
       const bottom = await makeEnlargedBottomRegion(file);
       const { data } = await worker.recognize(bottom);
-      firstPasses.push({ name: "enlarged lower alcohol details", text: data.text || "", confidence: data.confidence ?? 0 });
-      const alcoholSearchCrops = await makeAlcoholSearchCrops(file);
-      const priorMode = Tesseract.PSM.SPARSE_TEXT;
-      try {
-        await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK });
-        for (let i = 0; i < alcoholSearchCrops.length; i += 1) {
-          const { data: cropData } = await worker.recognize(alcoholSearchCrops[i]);
-          firstPasses.push({ name: `focused alcohol area ${i + 1}`, text: cropData.text || "", confidence: cropData.confidence ?? 0 });
-        }
-      } finally {
-        await worker.setParameters({ tessedit_pageseg_mode: priorMode });
+      addScan({ name: "enlarged lower alcohol details", text: data.text || "", confidence: data.confidence ?? 0 });
+      if (isAlcoholEvidenceMissing(firstPasses, application)) {
+        const alcoholCrop = await makeAlcoholSearchCrop(file);
+        const { data: cropData } = await worker.recognize(alcoholCrop);
+        addScan({ name: "focused alcohol area", text: cropData.text || "", confidence: cropData.confidence ?? 0 });
       }
     }
-    if (application.proof) {
+    if (application.proof && !firstPasses.some((scan) => hasExpectedAlcoholAndProof(scan.text, application)
+      && hasDistinctProofPresentation(scan.text, application))) {
       const alcoholCrop = await makeAlcoholDetailCrop(file, enhancedResult.data.blocks || [], enhanced.width, enhanced.height);
       if (alcoholCrop) {
         const { data } = await worker.recognize(alcoholCrop);
         const cropText = data.text || "";
-        firstPasses.push({
+        addScan({
           name: "focused ABV and proof detail",
           text: cropText,
           confidence: data.confidence ?? 0,
         });
       }
     }
-    const warningWordingRead = firstPasses.some((scan) => compareText(scan.text, application)
-      .some((check) => check.label === "Warning wording" && check.state === "pass"));
-    if (!warningWordingRead) {
-      const warningCrop = await makeWarningCrop(file, enhancedResult.data.blocks || [], enhanced.width, enhanced.height);
-      if (warningCrop) {
-        const { data } = await worker.recognize(warningCrop, {}, { blocks: true });
-        firstPasses.push({
-          name: "enlarged warning block",
-          text: data.text || "",
-          confidence: data.confidence ?? 0,
-          warningFormat: analyzeWarningFormat(data.blocks || [], warningCrop, data.text || ""),
-        });
-      }
+    if (!triedEarlyWarningCrop) {
+      await appendWarningCrop(worker, file, enhancedResult, enhanced, application, firstPasses, batchScans, addScan);
     }
     return firstPasses;
+  }
+
+  async function appendPaddleResults(paddleOcr, views, scans, startIndex, onScan = (scan) => scans.push(scan)) {
+    const selectedViews = views.slice(startIndex);
+    if (!selectedViews.length) return;
+    const startedAt = performance.now();
+    const results = await paddleOcr.predict(selectedViews.map(({ image }) => image));
+    console.info(`[LabelCheck timing] PaddleOCR read ${selectedViews.length} view(s) in ${Math.round(performance.now() - startedAt)} ms`);
+    results.forEach((result, index) => {
+      const items = result.items || [];
+      const scores = items.map((item) => item.score).filter(Number.isFinite);
+      onScan({
+        name: selectedViews[index].name,
+        text: orderPaddleText(items),
+        confidence: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length * 100 : 0,
+        engine: "paddle",
+      });
+    });
+  }
+
+  async function appendWarningCrop(worker, file, enhancedResult, enhanced, application, scans, batchScans = [], onScan = (scan) => scans.push(scan)) {
+    const warningWordingRead = [...batchScans, ...scans].some((scan) => compareText(scan.text, application)
+      .some((check) => check.label === "Warning wording" && check.state === "pass"));
+    if (warningWordingRead || scans.some((scan) => scan.name === "enlarged warning block")) return;
+    const cropStartedAt = performance.now();
+    const warningCrop = await makeWarningCrop(
+      file,
+      enhancedResult.data.blocks || [],
+      enhanced.width,
+      enhanced.height,
+    );
+    if (!warningCrop) {
+      console.info(`[LabelCheck timing] ${file.name}: warning crop unavailable; locating and preparing took ${Math.round(performance.now() - cropStartedAt)} ms`);
+      return;
+    }
+    const cropPreparedMs = performance.now() - cropStartedAt;
+    const recognizeStartedAt = performance.now();
+    const { data } = await worker.recognize(warningCrop, {}, { blocks: true });
+    console.info(`[LabelCheck timing] ${file.name}: warning crop ${warningCrop.width}x${warningCrop.height}; prepare ${Math.round(cropPreparedMs)} ms, OCR ${Math.round(performance.now() - recognizeStartedAt)} ms`);
+    onScan({
+      name: "enlarged warning block",
+      text: data.text || "",
+      confidence: data.confidence ?? 0,
+      warningFormat: analyzeWarningFormat(data.blocks || [], warningCrop, data.text || ""),
+    });
   }
 
   async function createPaddleOcr() {
@@ -764,10 +922,16 @@
       bitmap.close?.();
       return null;
     }
-    const targetWidth = Math.min(3600, Math.max(sourceWidth, 2200));
-    const scale = targetWidth / sourceWidth;
+    // Warning text needs enlargement, but forcing every crop to 2200 px wide
+    // can turn a tiny label region into a needlessly large OCR job. Keep the
+    // crop legible while limiting both upscaling and total pixels.
+    const scale = Math.min(
+      4,
+      2200 / sourceWidth,
+      Math.sqrt(2_400_000 / (sourceWidth * sourceHeight)),
+    );
     const crop = document.createElement("canvas");
-    crop.width = targetWidth;
+    crop.width = Math.max(1, Math.round(sourceWidth * scale));
     crop.height = Math.round(sourceHeight * scale);
     try {
       crop.getContext("2d").drawImage(bitmap, left, top, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height);
@@ -822,55 +986,50 @@
     return crop;
   }
 
-  async function makeAlcoholSearchCrops(file) {
+  async function makeAlcoholSearchCrop(file) {
     const image = await createImageBitmap(file);
-    const regions = [
-      { left: 0, top: 0.38, width: 1 },
-      { left: 0.16, top: 0.38, width: 0.68 },
-    ];
+    const region = { left: 0.12, top: 0.4, width: 0.76 };
     try {
-      return regions.map((region) => {
-        const sourceLeft = Math.round(image.width * region.left);
-        const sourceTop = Math.round(image.height * region.top);
-        const sourceWidth = Math.round(image.width * region.width);
-        const sourceHeight = image.height - sourceTop;
-        const scale = Math.min(2.5, 3000 / sourceWidth, 3600 / sourceHeight);
-        const crop = document.createElement("canvas");
-        crop.width = Math.max(1, Math.round(sourceWidth * scale));
-        crop.height = Math.max(1, Math.round(sourceHeight * scale));
-        const context = crop.getContext("2d", { willReadFrequently: true });
-        context.drawImage(image, sourceLeft, sourceTop, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height);
+      const sourceLeft = Math.round(image.width * region.left);
+      const sourceTop = Math.round(image.height * region.top);
+      const sourceWidth = Math.round(image.width * region.width);
+      const sourceHeight = image.height - sourceTop;
+      const scale = Math.min(2.5, 3000 / sourceWidth, 3600 / sourceHeight);
+      const crop = document.createElement("canvas");
+      crop.width = Math.max(1, Math.round(sourceWidth * scale));
+      crop.height = Math.max(1, Math.round(sourceHeight * scale));
+      const context = crop.getContext("2d", { willReadFrequently: true });
+      context.drawImage(image, sourceLeft, sourceTop, sourceWidth, sourceHeight, 0, 0, crop.width, crop.height);
 
-        // Normalize each alcohol-area crop independently so small lettering is
-        // not washed out by the much larger, darker parts of a full bottle photo.
-        const pixels = context.getImageData(0, 0, crop.width, crop.height);
-        const histogram = new Uint32Array(256);
-        for (let i = 0; i < pixels.data.length; i += 4) {
-          const gray = Math.round(0.299 * pixels.data[i] + 0.587 * pixels.data[i + 1] + 0.114 * pixels.data[i + 2]);
-          pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = gray;
-          histogram[gray] += 1;
-        }
-        const pixelCount = crop.width * crop.height;
-        let low = 0;
-        let high = 255;
-        let cumulative = 0;
-        for (let value = 0; value < 256; value += 1) {
-          cumulative += histogram[value];
-          if (cumulative >= pixelCount * 0.04) { low = value; break; }
-        }
-        cumulative = 0;
-        for (let value = 255; value >= 0; value -= 1) {
-          cumulative += histogram[value];
-          if (cumulative >= pixelCount * 0.04) { high = value; break; }
-        }
-        const range = Math.max(1, high - low);
-        for (let i = 0; i < pixels.data.length; i += 4) {
-          const value = Math.max(0, Math.min(255, ((pixels.data[i] - low) / range) * 255));
-          pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = value;
-        }
-        context.putImageData(pixels, 0, 0);
-        return crop;
-      });
+      // Normalize this alcohol-area crop independently so small lettering is
+      // not washed out by the darker parts of the full bottle photo.
+      const pixels = context.getImageData(0, 0, crop.width, crop.height);
+      const histogram = new Uint32Array(256);
+      for (let i = 0; i < pixels.data.length; i += 4) {
+        const gray = Math.round(0.299 * pixels.data[i] + 0.587 * pixels.data[i + 1] + 0.114 * pixels.data[i + 2]);
+        pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = gray;
+        histogram[gray] += 1;
+      }
+      const pixelCount = crop.width * crop.height;
+      let low = 0;
+      let high = 255;
+      let cumulative = 0;
+      for (let value = 0; value < 256; value += 1) {
+        cumulative += histogram[value];
+        if (cumulative >= pixelCount * 0.04) { low = value; break; }
+      }
+      cumulative = 0;
+      for (let value = 255; value >= 0; value -= 1) {
+        cumulative += histogram[value];
+        if (cumulative >= pixelCount * 0.04) { high = value; break; }
+      }
+      const range = Math.max(1, high - low);
+      for (let i = 0; i < pixels.data.length; i += 4) {
+        const value = Math.max(0, Math.min(255, ((pixels.data[i] - low) / range) * 255));
+        pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = value;
+      }
+      context.putImageData(pixels, 0, 0);
+      return crop;
     } finally {
       image.close?.();
     }
@@ -938,6 +1097,52 @@
     return count;
   }
 
+  function hasCoreFieldEvidence(scans, application) {
+    const required = [
+      "Brand name",
+      "Class / type",
+      "Alcohol content",
+      "Alcohol statement wording",
+      "Warning heading",
+      "Warning wording",
+    ];
+    if (application.proof) required.push("Proof");
+    if (application.netContents) required.push("Net contents");
+    const checks = scans.map((scan) => compareText(scan.text, application));
+    const fieldsFound = required.every((label) => checks.some((items) => items.some((check) =>
+      check.label === label && check.state === "pass")));
+    if (!fieldsFound) return false;
+    if (application.proof && !scans.some((scan) => hasExpectedAlcoholAndProof(scan.text, application)
+      && hasDistinctProofPresentation(scan.text, application))) return false;
+    return true;
+  }
+
+  function hasBatchCoreFieldEvidence(previousScans, currentScans, application) {
+    return hasCoreFieldEvidence([...previousScans, ...currentScans], application);
+  }
+
+  function hasBatchLabelDetailsEvidence(previousScans, currentScans, application) {
+    const scans = [...previousScans, ...currentScans];
+    const required = ["Brand name", "Class / type", "Alcohol content", "Alcohol statement wording"];
+    if (application.proof) required.push("Proof");
+    if (application.netContents) required.push("Net contents");
+    const checks = scans.map((scan) => compareText(scan.text, application));
+    if (!required.every((label) => checks.some((items) => items.some((check) =>
+      check.label === label && check.state === "pass")))) return false;
+    return !application.proof || scans.some((scan) => hasExpectedAlcoholAndProof(scan.text, application)
+      && hasDistinctProofPresentation(scan.text, application));
+  }
+
+  function hasWarningTextEvidence(scans, application) {
+    return ["Warning heading", "Warning wording"].every((label) => scans.some((scan) =>
+      compareText(scan.text, application).some((check) => check.label === label && check.state === "pass")));
+  }
+
+  function isAlcoholEvidenceMissing(scans, application) {
+    return (application.abv && !scans.some((scan) => confirmsAbv(scan.text, application.abv)))
+      || (application.proof && !scans.some((scan) => confirmsProof(scan.text, application.proof)));
+  }
+
   function estimateTextCurvature(blocks, imageWidth, imageHeight) {
     const curveEstimates = [];
     const lines = blocks.flatMap((block) => (block.paragraphs || []).flatMap((paragraph) => paragraph.lines || []));
@@ -1003,7 +1208,11 @@
   async function preparePhoto(file) {
     const bitmap = await createImageBitmap(file);
     const maxSide = Math.max(bitmap.width, bitmap.height);
-    const scale = maxSide < 2000 ? Math.min(1.5, 2000 / maxSide) : Math.min(1, 3200 / maxSide);
+    // Upscaling a small full photo adds work but no source detail. Keep the
+    // overview at native resolution and enlarge only focused text crops later.
+    const scale = maxSide < 900 ? 1
+      : maxSide < 2000 ? Math.min(1.5, 2000 / maxSide)
+        : Math.min(1, 3200 / maxSide);
     const width = Math.max(1, Math.round(bitmap.width * scale));
     const height = Math.max(1, Math.round(bitmap.height * scale));
     const original = document.createElement("canvas");
@@ -1493,12 +1702,11 @@
   }
 
   function updateProgress(message) {
-    if (message.status === "recognizing text" && Number.isFinite(message.progress)) {
-      const current = resultsList.lastElementChild?.querySelector(".progress-bar");
-      if (current) current.style.width = `${Math.round(message.progress * 100)}%`;
-      const text = resultsList.lastElementChild?.querySelector(".progress-text");
-      if (text) text.textContent = `Reading image… ${Math.round(message.progress * 100)}%`;
-    }
+    if (!message.status) return;
+    const text = resultsList.lastElementChild?.querySelector(".progress-text");
+    if (!text) return;
+    if (message.status === "loading tesseract core") text.textContent = "Loading image reader…";
+    else if (message.status === "recognizing text") text.textContent = "Reading label text…";
   }
 
   function findNear(text, query) {
